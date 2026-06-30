@@ -37,44 +37,35 @@
  *     }
  *   }
  * }
- */
-
-import * as z from "zod";
+ */ import * as z from "zod";
 import ky from "ky";
-import { contextHeaders, type RequestContext } from "../protocols/base.ts";
-import type { LocalHTTPToolConfig } from "../../_shared/supabase.ts";
-import type { ToolDefinition } from "./base.ts";
-
+import { contextHeaders } from "../protocols/base.ts";
 export const RequestToolInputSchema = z.object({
   url: z.string().describe("The request URL"),
-  method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+  method: z.enum([
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE"
+  ]),
   headers: z.record(z.string(), z.string()).optional(),
-  body: z
-    .looseObject({})
-    .optional()
-    .describe("JSON payload. If present, the correct header will be set."),
+  body: z.looseObject({}).optional().describe("JSON payload. If present, the correct header will be set.")
 });
-
 export const RequestToolOutputSchema = z.union([
   z.object({
     status: z.number(),
     isError: z.literal(true),
-    message: z.string(),
+    message: z.string()
   }),
   z.object({
     status: z.number(),
     isError: z.literal(false),
-    body: z.looseObject({}),
-  }),
+    body: z.looseObject({})
+  })
 ]);
-
-export async function requestToolImplementation(
-  input: z.infer<typeof RequestToolInputSchema>,
-  config: LocalHTTPToolConfig["config"],
-  context: RequestContext,
-): Promise<z.infer<typeof RequestToolOutputSchema>> {
+export async function requestToolImplementation(input, config, context) {
   // TODO: $context.conversation.contact_address value-like replacement
-
   // Security check: URL restriction
   if (config.url) {
     if (config.url.endsWith("/*")) {
@@ -83,7 +74,7 @@ export async function requestToolImplementation(
         return {
           status: 403,
           isError: true,
-          message: `URL not allowed. Must start with ${baseUrl}`,
+          message: `URL not allowed. Must start with ${baseUrl}`
         };
       }
     } else {
@@ -91,70 +82,61 @@ export async function requestToolImplementation(
         return {
           status: 403,
           isError: true,
-          message: `URL not allowed. Must match ${config.url}`,
+          message: `URL not allowed. Must match ${config.url}`
         };
       }
     }
   }
-
   // Security check: Method restriction
   if (config.methods && config.methods.length > 0) {
     if (!config.methods.includes(input.method)) {
       return {
         status: 403,
         isError: true,
-        message: `Method ${input.method} not allowed. Allowed: ${
-          config.methods.join(", ")
-        }`,
+        message: `Method ${input.method} not allowed. Allowed: ${config.methods.join(", ")}`
       };
     }
   }
-
   const response = await ky(input.url, {
     method: input.method,
     headers: {
       ...contextHeaders(context),
       ...input.headers,
-      ...config.headers,
+      ...config.headers
     },
-    json: input.body,
+    json: input.body
   });
-
   if (!response.ok) {
     return {
       status: response.status,
       isError: true,
-      message: await response.text(),
+      message: await response.text()
     };
   }
-
   const text = await response.text();
   let body;
   try {
     body = JSON.parse(text);
-  } catch {
-    body = { text };
+  } catch  {
+    body = {
+      text
+    };
   }
-
   return {
     status: response.status,
     isError: false,
-    body,
+    body
   };
 }
-
-export const RequestTool: ToolDefinition<
-  typeof RequestToolInputSchema,
-  typeof RequestToolOutputSchema,
-  LocalHTTPToolConfig["config"]
-> = {
+export const RequestTool = {
   provider: "local",
   type: "http",
   name: "request",
   description: "HTTP client. Works with JSON payloads only.",
   inputSchema: z.toJSONSchema(RequestToolInputSchema),
   outputSchema: z.toJSONSchema(RequestToolOutputSchema),
-  implementation: requestToolImplementation,
+  implementation: requestToolImplementation
 };
-
-export const HTTPTools = [RequestTool];
+export const HTTPTools = [
+  RequestTool
+];

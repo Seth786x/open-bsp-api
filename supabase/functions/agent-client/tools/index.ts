@@ -21,20 +21,16 @@
  * - Agent
  *
  *   Use an agent as tool. The conversation returns to the agent which made the call.
- */
-
-import { HTTPTools } from "./http.ts";
+ */ import { HTTPTools } from "./http.ts";
 import { SQLTools } from "./sql.ts";
 import { CalculatorTool } from "./calculator.ts";
-
 const FunctionTools = [
-  CalculatorTool,
+  CalculatorTool
 ];
-const CustomTools: unknown[] = [];
-
+const CustomTools = [];
 export const Toolbox = {
   function: FunctionTools,
   custom: CustomTools,
   http: HTTPTools,
-  sql: SQLTools,
+  sql: SQLTools
 };

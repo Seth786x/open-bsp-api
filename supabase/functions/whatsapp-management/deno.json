@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2",
+    "ky": "npm:ky@1",
+    "@hono/hono": "jsr:@hono/hono@4"
+  }
+}

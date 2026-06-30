@@ -1,18 +1,9 @@
-import type { AgentProtocolHandler, RequestContext } from "./base.ts";
 import { ChatCompletionsHandler } from "./chat-completions.ts";
 import { A2AHandler } from "./a2a.ts";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import type { AgentTool } from "../index.ts";
-
 export class ProtocolFactory {
-  static getHandler(
-    tools: AgentTool[],
-    context: RequestContext,
-    client: SupabaseClient,
-  ): AgentProtocolHandler {
+  static getHandler(tools, context, client) {
     const protocol = context.agent.extra.protocol || "chat_completions";
-
-    switch (protocol) {
+    switch(protocol){
       case "chat_completions":
         return new ChatCompletionsHandler(tools, context, client);
       case "a2a":

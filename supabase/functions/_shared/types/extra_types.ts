@@ -26,15 +26,25 @@ export type OrganizationExtra = {
   error_messages_direction?: "internal" | "outgoing";
 };
 
+export type SyncedTemplate = {
+  id: string;
+  name: string;
+  status: string;
+  category: string;
+  language: string;
+};
+
 export type WhatsAppOrganizationAddressExtra = {
   waba_id?: string;
   business_id?: string;
   phone_number?: string;
   verified_name?: string;
+  quality_rating?: string;
   flow_type?: "only_waba" | "new_phone_number" | "existing_phone_number";
   access_token?: string; // Meta system-user token
   callback_url?: string | null;
   verify_token?: string | null;
+  templates?: SyncedTemplate[];
 };
 
 export type InstagramOrganizationAddressExtra = {
