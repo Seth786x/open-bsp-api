@@ -3,6 +3,7 @@ import { HTTPException } from "jsr:@hono/hono/http-exception";
 const API_VERSION = "v24.0";
 const APP_ID = Deno.env.get("META_APP_ID");
 const APP_SECRET = Deno.env.get("META_APP_SECRET");
+const DEFAULT_ACCESS_TOKEN = Deno.env.get("META_SYSTEM_USER_ACCESS_TOKEN") || "";
 /** Normalize phone number to digits only (e.g., "+54 9 260 423 7115" -> "5492604237115") */ function normalizePhoneNumber(phone) {
   return phone.replace(/\D/g, "");
 }
@@ -115,6 +116,51 @@ async function postInitDataSync(business_access_token, phone_number_id, type) {
   }
   return await response.json();
 }
+export async function performSignup(client, payload, business_access_token) {
+  log.info("Step 2: Subscribe to webhooks on the customer's WABA");
+  await postSubscribeToWebhooks(business_access_token, payload.waba_id, payload.callback_url, payload.verify_token);
+  if (payload.flow_type === "existing_phone_number") {
+    log.info("Coexistence flow: Skipping step 3");
+  } else {
+    log.info("Step 3: Register the customer's phone number");
+    const pin = "123456";
+    await postRegisterPhoneNumber(business_access_token, payload.phone_number_id, pin);
+  }
+  log.info("Getting phone number data");
+  const phone_number = await getPhoneNumber(business_access_token, payload.phone_number_id);
+  log.info("Persisting phone number data");
+  const { data, error } = await client.from("organizations_addresses").upsert({
+    service: "whatsapp",
+    address: payload.phone_number_id,
+    organization_id: payload.organization_id,
+    status: "connected",
+    extra: {
+      waba_id: payload.waba_id,
+      business_id: payload.business_id,
+      flow_type: payload.flow_type,
+      access_token: business_access_token,
+      phone_number: normalizePhoneNumber(phone_number.display_phone_number),
+      verified_name: phone_number.verified_name,
+      quality_rating: phone_number.quality_rating,
+      callback_url: payload.callback_url || null,
+      verify_token: payload.verify_token || null
+    }
+  }).select().single();
+  if (error) {
+    throw new HTTPException(500, {
+      message: "Could not persist phone number data",
+      cause: error
+    });
+  }
+  if (payload.flow_type === "existing_phone_number") {
+    log.info("Step 4: Initiating contacts sync");
+    await postInitDataSync(business_access_token, payload.phone_number_id, "contacts");
+    log.info("Step 5: Initiating messages sync");
+    await postInitDataSync(business_access_token, payload.phone_number_id, "messages");
+  }
+  return data;
+}
+
 export async function performEmbeddedSignup(client, payload) {
   if (!payload.code) {
     throw new HTTPException(400, {
@@ -161,49 +207,8 @@ export async function performEmbeddedSignup(client, payload) {
   const app_secret = secrets[idIndex];
   log.info("Step 1: Exchange the token code for a business token");
   const business_access_token = await getBusinessAccessToken(app_id, app_secret, payload.code);
-  log.info("Step 2: Subscribe to webhooks on the customer's WABA");
-  await postSubscribeToWebhooks(business_access_token, payload.waba_id, payload.callback_url, payload.verify_token);
-  if (payload.flow_type === "existing_phone_number") {
-    log.info("Coexistence flow: Skipping step 3");
-  } else {
-    log.info("Step 3: Register the customer's phone number");
-    const pin = "123456";
-    await postRegisterPhoneNumber(business_access_token, payload.phone_number_id, pin);
-  }
-  log.info("Getting phone number data");
-  const phone_number = await getPhoneNumber(business_access_token, payload.phone_number_id);
-  log.info("Persisting phone number data");
-  const { data, error } = await client.from("organizations_addresses").upsert({
-    service: "whatsapp",
-    address: payload.phone_number_id,
-    organization_id: payload.organization_id,
-    status: "connected",
-    extra: {
-      waba_id: payload.waba_id,
-      business_id: payload.business_id,
-      flow_type: payload.flow_type,
-      access_token: business_access_token,
-      phone_number: normalizePhoneNumber(phone_number.display_phone_number),
-      verified_name: phone_number.verified_name,
-      quality_rating: phone_number.quality_rating,
-      callback_url: payload.callback_url || null,
-      verify_token: payload.verify_token || null
-    }
-  }).select().single();
-  if (error) {
-    throw new HTTPException(500, {
-      message: "Could not persist phone number data",
-      cause: error
-    });
-  }
-  // App data sync is a coexistence only feature
-  if (payload.flow_type === "existing_phone_number") {
-    log.info("Step 4: Initiating contacts sync");
-    await postInitDataSync(business_access_token, payload.phone_number_id, "contacts");
-    log.info("Step 5: Initiating messages sync");
-    await postInitDataSync(business_access_token, payload.phone_number_id, "messages");
-  }
-  return data;
+
+  return await performSignup(client, payload, business_access_token);
 }
 async function deregisterPhoneNumber(business_access_token, phone_number_id) {
   log.info(`Deregistering phone number: ${phone_number_id}`);
@@ -231,7 +236,7 @@ export async function deleteSignup(client, payload) {
       message: "Cannot deregister organization address. Only new phone numbers can be deregistered."
     });
   }
-  await deregisterPhoneNumber(extra.access_token || "", phone_number_id);
+  await deregisterPhoneNumber(extra.access_token || DEFAULT_ACCESS_TOKEN, phone_number_id);
   const { data } = await client.from("organizations_addresses").update({
     status: "disconnected"
   }).eq("organization_id", organization_id).eq("address", phone_number_id).select().single().throwOnError();

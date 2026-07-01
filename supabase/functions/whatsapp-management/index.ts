@@ -6,7 +6,8 @@ import { HTTPException } from "jsr:@hono/hono/http-exception";
 import * as log from "../_shared/logger.ts";
 import { createApiClient, createClient, createUnsecureClient } from "../_shared/supabase.ts";
 import { createTemplate, deleteTemplate, editTemplate, fetchTemplate, listTemplates } from "./templates.ts";
-import { deleteSignup, performEmbeddedSignup } from "./embedded_signup.ts";
+import { deleteSignup, performEmbeddedSignup, performSignup } from "./embedded_signup.ts";
+const DEFAULT_ACCESS_TOKEN = Deno.env.get("META_SYSTEM_USER_ACCESS_TOKEN") || "";
 const app = new Hono();
 // CORS middleware
 app.use("*", cors());
@@ -169,6 +170,46 @@ app.delete("/whatsapp-management/signup", requireRoles([
   const address = await deleteSignup(unsecureClient, payload);
   return c.json(address);
 });
+
+// Manual connect route — uses master token for partner-delegated scenarios
+app.post("/whatsapp-management/manual-connect", async (c)=>{
+  const payload = await c.req.json();
+  log.info("Manual connect payload", payload);
+
+  if (!payload.organization_id) {
+    throw new HTTPException(400, { message: "Missing 'organization_id' body param!" });
+  }
+  if (!payload.waba_id) {
+    throw new HTTPException(400, { message: "Missing 'waba_id' body param!" });
+  }
+  if (!payload.phone_number_id) {
+    throw new HTTPException(400, { message: "Missing 'phone_number_id' body param!" });
+  }
+  if (!DEFAULT_ACCESS_TOKEN) {
+    throw new HTTPException(401, { message: "META_SYSTEM_USER_ACCESS_TOKEN environment variable not set" });
+  }
+
+  const unsecureClient = createUnsecureClient();
+  try {
+    const address = await performSignup(unsecureClient, payload, DEFAULT_ACCESS_TOKEN);
+    return c.json(address);
+  } catch (error) {
+    if (error instanceof HTTPException) {
+      log.error(error.message, error);
+      await unsecureClient.from("logs").insert({
+        organization_id: payload.organization_id,
+        category: "signup",
+        level: "error",
+        message: error.message,
+        metadata: error.cause
+      }).throwOnError();
+    } else {
+      log.error("Manual connect failed", error);
+    }
+    throw error;
+  }
+});
+
 // Public onboard routes (no auth required, token-based)
 app.get("/whatsapp-management/onboard", async (c)=>{
   const token = c.req.query("token");
