@@ -160,7 +160,6 @@ export async function performSignup(client, payload, business_access_token) {
   }
   return data;
 }
-
 export async function performEmbeddedSignup(client, payload) {
   if (!payload.code) {
     throw new HTTPException(400, {
@@ -207,7 +206,6 @@ export async function performEmbeddedSignup(client, payload) {
   const app_secret = secrets[idIndex];
   log.info("Step 1: Exchange the token code for a business token");
   const business_access_token = await getBusinessAccessToken(app_id, app_secret, payload.code);
-
   return await performSignup(client, payload, business_access_token);
 }
 async function deregisterPhoneNumber(business_access_token, phone_number_id) {

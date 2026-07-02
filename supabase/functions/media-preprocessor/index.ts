@@ -1,60 +1,29 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import {
-  createUnsecureClient,
-  type MessageRow,
-  type Part,
-  type WebhookPayload,
-} from "../_shared/supabase.ts";
-import {
-  type ApiError,
-  type GenerateContentResponse,
-  GoogleGenAI,
-} from "@google/genai";
+import { createUnsecureClient } from "../_shared/supabase.ts";
+import { GoogleGenAI } from "@google/genai";
 import { downloadFromStorage, uploadToStorage } from "../_shared/media.ts";
 import { encodeBase64 } from "jsr:@std/encoding/base64";
 import * as log from "../_shared/logger.ts";
 import { stringify } from "jsr:@std/csv/stringify";
-import { Json } from "../_shared/db_types.ts";
-
-type ModalityTokenCount = { modality: string; tokenCount: number };
-
-function calculateCost(
-  usage: GenerateContentResponse["usageMetadata"],
-  pricing: Record<string, number>,
-  quantity: number,
-): number {
+function calculateCost(usage, pricing, quantity) {
   if (!usage) return 0;
-
   const cached = usage.cachedContentTokenCount ?? 0;
   const completion = usage.candidatesTokenCount ?? 0;
-
   let inputCost = 0;
-  const promptDetails = usage.promptTokensDetails as
-    | ModalityTokenCount[]
-    | undefined;
-  const cacheDetails = usage.cacheTokensDetails as
-    | ModalityTokenCount[]
-    | undefined;
-
+  const promptDetails = usage.promptTokensDetails;
+  const cacheDetails = usage.cacheTokensDetails;
   if (promptDetails?.length) {
-    for (const { modality, tokenCount } of promptDetails) {
-      const key = modality === "TEXT"
-        ? "input"
-        : `${modality.toLowerCase()}_input`;
+    for (const { modality, tokenCount } of promptDetails){
+      const key = modality === "TEXT" ? "input" : `${modality.toLowerCase()}_input`;
       inputCost += tokenCount * (pricing[key] ?? pricing.input ?? 0);
     }
     // Subtract cached tokens at full rate, add back at per-modality cache rate
     if (cacheDetails?.length) {
-      for (const { modality, tokenCount } of cacheDetails) {
-        const inputKey = modality === "TEXT"
-          ? "input"
-          : `${modality.toLowerCase()}_input`;
-        const cacheKey = modality === "TEXT"
-          ? "cache_read"
-          : `${modality.toLowerCase()}_cache_read`;
+      for (const { modality, tokenCount } of cacheDetails){
+        const inputKey = modality === "TEXT" ? "input" : `${modality.toLowerCase()}_input`;
+        const cacheKey = modality === "TEXT" ? "cache_read" : `${modality.toLowerCase()}_cache_read`;
         inputCost -= tokenCount * (pricing[inputKey] ?? pricing.input ?? 0);
-        inputCost += tokenCount *
-          (pricing[cacheKey] ?? pricing.cache_read ?? pricing.input ?? 0);
+        inputCost += tokenCount * (pricing[cacheKey] ?? pricing.cache_read ?? pricing.input ?? 0);
       }
     } else if (cached > 0) {
       inputCost -= cached * (pricing.input ?? 0);
@@ -63,13 +32,10 @@ function calculateCost(
   } else {
     // Fallback: no modality breakdown
     const prompt = usage.promptTokenCount ?? 0;
-    inputCost = (prompt - cached) * (pricing.input ?? 0) +
-      cached * (pricing.cache_read ?? pricing.input ?? 0);
+    inputCost = (prompt - cached) * (pricing.input ?? 0) + cached * (pricing.cache_read ?? pricing.input ?? 0);
   }
-
   return (inputCost + completion * (pricing.output ?? 0)) / quantity;
 }
-
 /**
  * Documentation for automatic file annotation handling:
  *
@@ -108,116 +74,77 @@ function calculateCost(
  *     PDFs up to 1000 pages
  * - Edge Functions limits
  *     Maximum Duration (Wall clock limit): Free plan: 150s, Paid plans: 400s
- */
-const MAX_SMALL_DOCUMENT_SIZE = 2 * 1000; // 2 KB
+ */ const MAX_SMALL_DOCUMENT_SIZE = 2 * 1000; // 2 KB
 const INLINE_DATA_SIZE_LIMIT = 19 * 1000 * 1000; // 19MB
-
-const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-
-Deno.serve(async (req) => {
+const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+Deno.serve(async (req)=>{
   const authHeader = req.headers.get("Authorization");
   const token = authHeader?.replace("Bearer ", "");
-
   if (token !== SERVICE_ROLE_KEY) {
-    return new Response("Unauthorized", { status: 401 });
+    return new Response("Unauthorized", {
+      status: 401
+    });
   }
-
   const client = createUnsecureClient();
-
-  const incoming = ((await req.json()) as WebhookPayload<MessageRow>).record!;
-
-  const log_update_and_respond = async (
-    logLevel: "error" | "warn" | "info",
-    logMessage: string,
-  ) => {
+  const incoming = (await req.json()).record;
+  const log_update_and_respond = async (logLevel, logMessage)=>{
     log[logLevel](logMessage);
-
-    await client
-      .from("messages")
-      .update({ status: { preprocessed: new Date().toISOString() } })
-      .eq("id", incoming.id)
-      .throwOnError();
-
+    await client.from("messages").update({
+      status: {
+        preprocessed: new Date().toISOString()
+      }
+    }).eq("id", incoming.id).throwOnError();
     return new Response();
   };
-
-  const { data: conv } = await client
-    .from("conversations")
-    .select(`*, organizations (*)`)
-    .eq("id", incoming.conversation_id)
-    .single()
-    .throwOnError();
-
+  const { data: conv } = await client.from("conversations").select(`*, organizations (*)`).eq("id", incoming.conversation_id).single().throwOnError();
   const org = conv.organizations;
-
   if (!conv.extra) {
     conv.extra = {};
   }
-
   if (!org.extra) {
     org.extra = {};
   }
-
   const config = org.extra.media_preprocessing || {};
-
   if (config.mode !== "active") {
-    return log_update_and_respond(
-      "info",
-      "Media preprocessing mode is not active. Skipping preprocessing.",
-    );
+    return log_update_and_respond("info", "Media preprocessing mode is not active. Skipping preprocessing.");
   }
-
   const model = config.model || "gemini-2.5-flash";
-
   const language = config.language || "English";
-
   const apiKey = config.api_key || Deno.env.get("GOOGLE_API_KEY");
-
   if (!apiKey) {
-    return log_update_and_respond(
-      "warn",
-      "GOOGLE_API_KEY not set. Skipping preprocessing.",
-    );
+    return log_update_and_respond("warn", "GOOGLE_API_KEY not set. Skipping preprocessing.");
   }
-
   const genai = new GoogleGenAI({
-    apiKey,
+    apiKey
   });
-
   const { content, status } = incoming;
-
   if (content.type !== "file") {
-    return log_update_and_respond(
-      "error",
-      "Incoming message is not a file. Skipping preprocessing.",
-    );
+    return log_update_and_respond("error", "Incoming message is not a file. Skipping preprocessing.");
   }
-
   const mimeType = content.file.mime_type;
   const mediaType = content.kind === "sticker" ? "image" : content.kind;
-
-  const allowedMimeTypes: Record<string, string[]> = {
+  const allowedMimeTypes = {
     audio: [
       "audio/wav",
       "audio/mp3",
       "audio/aiff",
       "audio/aac",
       "audio/ogg",
-      "audio/flac",
+      "audio/flac"
     ],
     image: [
       "image/png",
       "image/jpeg",
       "image/webp",
       "image/heic",
-      "image/heif",
+      "image/heif"
     ],
     sticker: [
       "image/png",
       "image/jpeg",
       "image/webp",
       "image/heic",
-      "image/heif",
+      "image/heif"
     ],
     video: [
       "video/mp4",
@@ -228,344 +155,254 @@ Deno.serve(async (req) => {
       "video/mpg",
       "video/webm",
       "video/wmv",
-      "video/3gpp",
+      "video/3gpp"
     ],
     document: [
-      "application/pdf", // PDF is the only mime type which goes through visual recognition
+      "application/pdf",
       // All the other mime types extract text content
       // "text/*"
       "application/json",
       "application/xml",
       "application/javascript",
       "application/sql",
-      "application/rtf",
-    ],
+      "application/rtf"
+    ]
   };
-
-  const isSupportedMimeType = mimeType.startsWith("text/") ||
-    allowedMimeTypes[mediaType]?.includes(mimeType.split(";")[0]); // "audio/ogg; codecs=opus" -> "audio/ogg"
-
+  const isSupportedMimeType = mimeType.startsWith("text/") || allowedMimeTypes[mediaType]?.includes(mimeType.split(";")[0]); // "audio/ogg; codecs=opus" -> "audio/ogg"
   if (!isSupportedMimeType) {
-    return log_update_and_respond(
-      "warn",
-      `Unsupported mime type ${mimeType} for media type ${mediaType}. Skipping preprocessing.`,
-    );
+    return log_update_and_respond("warn", `Unsupported mime type ${mimeType} for media type ${mediaType}. Skipping preprocessing.`);
   }
-
   // Check if we need to use File API vs inline data. Max payload size is 20MB.
   // Use 19MB limit to leave space for prompt and other request data.
   // We multiply by 1.33 to account for the base64 encoding overhead.
   const shouldUseFileAPI = content.file.size * 1.33 > INLINE_DATA_SIZE_LIMIT;
-
   if (shouldUseFileAPI) {
-    return log_update_and_respond(
-      "warn",
-      "Base64 encoded data size exceeds 19MB limit. File should be uploaded using the Gemini File API but it is not implemented yet.",
-    );
+    return log_update_and_respond("warn", "Base64 encoded data size exceeds 19MB limit. File should be uploaded using the Gemini File API but it is not implemented yet.");
   }
-
   // Check AI credits balance before touching storage (only when using our API key)
   const billable = !config.api_key;
-
   // Fetch cost pricing before the LLM call
-  const { data: costs } = await client
-    .schema("billing")
-    .from("costs")
-    .select("pricing, quantity")
-    .eq("provider", "google")
-    .eq("product", model)
-    .lte("effective_at", new Date().toISOString())
-    .order("effective_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
-    .throwOnError();
-
+  const { data: costs } = await client.schema("billing").from("costs").select("pricing, quantity").eq("provider", "google").eq("product", model).lte("effective_at", new Date().toISOString()).order("effective_at", {
+    ascending: false
+  }).limit(1).maybeSingle().throwOnError();
   if (billable) {
     if (!costs) {
-      return log_update_and_respond(
-        "warn",
-        `No pricing found for google/${model}`,
-      );
+      return log_update_and_respond("warn", `No pricing found for google/${model}`);
     }
-
-    const { error } = await client
-      .schema("billing")
-      .rpc("check_limit", {
-        _organization_id: org.id,
-        _product_id: "ai_credits",
-        _amount: 0,
-      });
-
+    const { error } = await client.schema("billing").rpc("check_limit", {
+      _organization_id: org.id,
+      _product_id: "ai_credits",
+      _amount: 0
+    });
     if (error) {
-      return log_update_and_respond(
-        "warn",
-        `AI credits check failed: ${error.message}`,
-      );
+      return log_update_and_respond("warn", `AI credits check failed: ${error.message}`);
     }
   }
-
-  await client
-    .from("messages")
-    .update({ status: { preprocessing: new Date().toISOString() } })
-    .eq("id", incoming.id)
-    .throwOnError();
-
+  await client.from("messages").update({
+    status: {
+      preprocessing: new Date().toISOString()
+    }
+  }).eq("id", incoming.id).throwOnError();
   const file = await downloadFromStorage(client, content.file.uri);
   const base64File = encodeBase64(await file.arrayBuffer());
-
   let prompt = "";
-
-  switch (mediaType) {
+  switch(mediaType){
     case "audio":
-      prompt =
-        `Analyze this audio file. Provide a transcription of the audio content in its original language and a brief description in ${language} of what it contains (voice, music, noises, etc.). If it's voice, include emotion recognition in the description.`;
+      prompt = `Analyze this audio file. Provide a transcription of the audio content in its original language and a brief description in ${language} of what it contains (voice, music, noises, etc.). If it's voice, include emotion recognition in the description.`;
       break;
     case "video":
-      prompt =
-        `Analyze this video file. Provide a transcription of any audio content in its original language and a brief description in ${language} of what the video shows.`;
+      prompt = `Analyze this video file. Provide a transcription of any audio content in its original language and a brief description in ${language} of what the video shows.`;
       break;
     case "image":
-      prompt =
-        `Analyze this image. If it contains text, extract it as transcription in its original language using markdown format if possible. Provide a brief description in ${language} of the image content, or if it's a document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
+      prompt = `Analyze this image. If it contains text, extract it as transcription in its original language using markdown format if possible. Provide a brief description in ${language} of the image content, or if it's a document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
       break;
     case "document":
       if (mimeType === "text/csv") {
-        prompt =
-          `Analyze this CSV document. Do not transcribe! Do not extract the data as a table either! Provide a brief description in ${language} of the data (column names, row samples, etc.).`;
+        prompt = `Analyze this CSV document. Do not transcribe! Do not extract the data as a table either! Provide a brief description in ${language} of the data (column names, row samples, etc.).`;
       } else if (mimeType === "application/pdf") {
-        prompt =
-          `Analyze this PDF document. Extract the text content as transcription in its original language using markdown format if possible. If the content includes a table, do not transcribe the table. Instead, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
+        prompt = `Analyze this PDF document. Extract the text content as transcription in its original language using markdown format if possible. If the content includes a table, do not transcribe the table. Instead, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
       } else {
-        prompt =
-          `Analyze this text document. Do not transcribe! If the content includes a table, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
+        prompt = `Analyze this text document. Do not transcribe! If the content includes a table, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
       }
       break;
     default:
-      prompt =
-        `Analyze this file and provide a transcription of any text content in its original language and a brief description in ${language} of what it contains.`;
+      prompt = `Analyze this file and provide a transcription of any text content in its original language and a brief description in ${language} of what it contains.`;
   }
-
   if (config?.extra_prompt) {
     prompt += `\n\n${config.extra_prompt}`;
   }
-
   const responseSchema = {
     type: "object",
     properties: {
       transcription: {
-        type: "string",
+        type: "string"
       },
       description: {
-        type: "string",
+        type: "string"
       },
       table: {
         type: "array",
         items: {
           type: "array",
           items: {
-            type: "string",
-          },
-        },
-      },
-    },
+            type: "string"
+          }
+        }
+      }
+    }
   };
-
-  const contents: Array<
-    | {
-      text: string;
-    }
-    | {
-      inlineData: { mimeType: string; data: string };
-    }
-  > = [
+  const contents = [
     {
       inlineData: {
         mimeType: mimeType,
-        data: base64File,
-      },
-    },
+        data: base64File
+      }
+    }
   ];
-
   if (mediaType === "image") {
     // Documentation recommends to put the prompt at the end for images
-    contents.push({ text: prompt });
+    contents.push({
+      text: prompt
+    });
   } else {
-    contents.unshift({ text: prompt });
+    contents.unshift({
+      text: prompt
+    });
   }
-
-  let response: GenerateContentResponse;
-
+  let response;
   try {
     response = await genai.models.generateContent({
       model,
       contents: contents,
       config: {
         responseMimeType: "application/json",
-        responseSchema: responseSchema,
-      },
+        responseSchema: responseSchema
+      }
     });
   } catch (error) {
     // https://ai.google.dev/gemini-api/docs/troubleshooting
-    const status = (error as ApiError).status;
-
+    const status = error.status;
     // 429 can be rate limiting (retryable) or quota exhaustion (not retryable)
     if (status === 429) {
       const message = String(error);
-      const isQuotaExhausted = message.includes("quota") ||
-        message.includes("RESOURCE_EXHAUSTED");
-
+      const isQuotaExhausted = message.includes("quota") || message.includes("RESOURCE_EXHAUSTED");
       if (isQuotaExhausted) {
-        return log_update_and_respond(
-          "warn",
-          `Gemini API quota exhausted for ${model}. Skipping preprocessing.`,
-        );
+        return log_update_and_respond("warn", `Gemini API quota exhausted for ${model}. Skipping preprocessing.`);
       }
     }
-
     // 500, 503: transient server errors worth retrying
-    if ([429, 500, 503].includes(status)) {
+    if ([
+      429,
+      500,
+      503
+    ].includes(status)) {
       log.error("Retryable Gemini API error in preprocessing", error);
       throw error;
     }
-
-    return log_update_and_respond(
-      "error",
-      `Gemini API error in preprocessing. Skipping preprocessing. ${error}`,
-    );
+    return log_update_and_respond("error", `Gemini API error in preprocessing. Skipping preprocessing. ${error}`);
   }
-
   // Record AI usage in the ledger
   if (response.usageMetadata) {
     let cost = 0;
-
     if (costs) {
-      cost = calculateCost(
-        response.usageMetadata,
-        costs.pricing as Record<string, number>,
-        costs.quantity,
-      );
+      cost = calculateCost(response.usageMetadata, costs.pricing, costs.quantity);
     }
-
-    await client
-      .schema("billing")
-      .from("ledger")
-      .insert({
-        organization_id: org.id,
-        product_id: "ai_credits",
-        type: "consumption",
-        quantity: -cost,
-        provider: "google",
-        model,
-        billable,
-        metadata: response.usageMetadata as Json,
-      })
-      .throwOnError();
+    await client.schema("billing").from("ledger").insert({
+      organization_id: org.id,
+      product_id: "ai_credits",
+      type: "consumption",
+      quantity: -cost,
+      provider: "google",
+      model,
+      billable,
+      metadata: response.usageMetadata
+    }).throwOnError();
   }
-
   if (!response?.text) {
-    return log_update_and_respond(
-      "error",
-      "No response text received from the preprocessing model. Skipping preprocessing.",
-    );
+    return log_update_and_respond("error", "No response text received from the preprocessing model. Skipping preprocessing.");
   }
-
-  let result: {
-    transcription: string | undefined;
-    description: string | undefined;
-    table: Array<Array<string>> | undefined;
-  };
-
+  let result;
   try {
     result = JSON.parse(response.text);
   } catch (_error) {
-    return log_update_and_respond(
-      "error",
-      "Failed to parse the response text from the preprocessing model into a JSON object. Skipping preprocessing.",
-    );
+    return log_update_and_respond("error", "Failed to parse the response text from the preprocessing model into a JSON object. Skipping preprocessing.");
   }
-
-  const artifacts: Part[] = [];
-
+  const artifacts = [];
   if (result.description) {
     artifacts.push({
       type: "text",
       kind: "description",
-      text: result.description,
+      text: result.description
     });
   }
-
   // PDF transcription exceeding 2KB
-  if (
-    mimeType === "application/pdf" &&
-    result.transcription &&
-    result.transcription.length > MAX_SMALL_DOCUMENT_SIZE
-  ) {
+  if (mimeType === "application/pdf" && result.transcription && result.transcription.length > MAX_SMALL_DOCUMENT_SIZE) {
     // Store enriched documents (PDF) transcription as llm.txt
-    const name = [content.file.name, "llm.txt"].join(".");
-
-    const file = new Blob([result.transcription], {
-      type: "text/markdown",
+    const name = [
+      content.file.name,
+      "llm.txt"
+    ].join(".");
+    const file = new Blob([
+      result.transcription
+    ], {
+      type: "text/markdown"
     });
-
     const uri = await uploadToStorage(client, org.id, file);
-
     artifacts.push({
       type: "file",
       kind: "document",
-      file: { mime_type: file.type, uri, name, size: file.size },
+      file: {
+        mime_type: file.type,
+        uri,
+        name,
+        size: file.size
+      }
     });
-
     result.transcription = undefined;
   }
-
-  if (
-    result.transcription &&
-    // Do not store the transcription for text documents safeguard
-    (mediaType !== "document" || mimeType === "application/pdf")
-  ) {
+  if (result.transcription && // Do not store the transcription for text documents safeguard
+  (mediaType !== "document" || mimeType === "application/pdf")) {
     artifacts.push({
       type: "text",
       kind: "transcription",
-      text: result.transcription,
+      text: result.transcription
     });
   }
-
   // Do not create a CSV from a CSV safeguard
   if (result.table?.length && mimeType !== "text/csv") {
     const csv = stringify(result.table);
-
-    const name = [content.file.name, "csv"].join(".");
-
-    const file = new Blob([csv], {
-      type: "text/csv",
+    const name = [
+      content.file.name,
+      "csv"
+    ].join(".");
+    const file = new Blob([
+      csv
+    ], {
+      type: "text/csv"
     });
-
     const uri = await uploadToStorage(client, org.id, file);
-
     artifacts.push({
       type: "file",
       kind: "document",
-      file: { mime_type: file.type, uri, name, size: file.size },
+      file: {
+        mime_type: file.type,
+        uri,
+        name,
+        size: file.size
+      }
     });
   }
-
   const preprocessed = {
     ...incoming,
     content: {
       ...content,
-      artifacts,
+      artifacts
     },
     status: {
       ...status,
-      preprocessed: new Date().toISOString(),
-    },
+      preprocessed: new Date().toISOString()
+    }
   };
-
-  await client
-    .from("messages")
-    .update(preprocessed)
-    .eq("id", incoming.id)
-    .throwOnError();
-
+  await client.from("messages").update(preprocessed).eq("id", incoming.id).throwOnError();
   return new Response();
 });

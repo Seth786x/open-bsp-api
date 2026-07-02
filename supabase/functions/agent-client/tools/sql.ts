@@ -333,7 +333,7 @@ class BaseClient {
     return '"' + identifier + '"';
   }
   sanitizeIdentifier(identifier) {
-    return identifier.trim().toLowerCase()// allow letters (including accents), digits, and underscore
+    return identifier.trim().toLowerCase() // allow letters (including accents), digits, and underscore
     .replace(/[^\p{L}\p{N}_]+/gu, "_") // \p{L} = any kind of letter, \p{N} = any kind of digit
     ;
   }

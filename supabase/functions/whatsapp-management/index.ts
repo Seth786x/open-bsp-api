@@ -170,25 +170,30 @@ app.delete("/whatsapp-management/signup", requireRoles([
   const address = await deleteSignup(unsecureClient, payload);
   return c.json(address);
 });
-
 // Manual connect route — uses master token for partner-delegated scenarios
 app.post("/whatsapp-management/manual-connect", async (c)=>{
   const payload = await c.req.json();
   log.info("Manual connect payload", payload);
-
   if (!payload.organization_id) {
-    throw new HTTPException(400, { message: "Missing 'organization_id' body param!" });
+    throw new HTTPException(400, {
+      message: "Missing 'organization_id' body param!"
+    });
   }
   if (!payload.waba_id) {
-    throw new HTTPException(400, { message: "Missing 'waba_id' body param!" });
+    throw new HTTPException(400, {
+      message: "Missing 'waba_id' body param!"
+    });
   }
   if (!payload.phone_number_id) {
-    throw new HTTPException(400, { message: "Missing 'phone_number_id' body param!" });
+    throw new HTTPException(400, {
+      message: "Missing 'phone_number_id' body param!"
+    });
   }
   if (!DEFAULT_ACCESS_TOKEN) {
-    throw new HTTPException(401, { message: "META_SYSTEM_USER_ACCESS_TOKEN environment variable not set" });
+    throw new HTTPException(401, {
+      message: "META_SYSTEM_USER_ACCESS_TOKEN environment variable not set"
+    });
   }
-
   const unsecureClient = createUnsecureClient();
   try {
     const address = await performSignup(unsecureClient, payload, DEFAULT_ACCESS_TOKEN);
@@ -209,7 +214,6 @@ app.post("/whatsapp-management/manual-connect", async (c)=>{
     throw error;
   }
 });
-
 // Public onboard routes (no auth required, token-based)
 app.get("/whatsapp-management/onboard", async (c)=>{
   const token = c.req.query("token");
